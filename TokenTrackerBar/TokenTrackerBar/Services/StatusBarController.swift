@@ -1008,7 +1008,7 @@ final class StatusBarController: NSObject {
             ?? NSScreen.main else { return }
         let anchor = anchorWindow.frame
         var frame = popoverWindow.frame
-        let displaced = popoverWindow.screen !== screen
+        let displaced = popoverWindow.screen !== anchorWindow.screen
             || PopoverPlacementPolicy.isDisplaced(
                 popoverFrame: frame,
                 anchorFrame: anchor,
