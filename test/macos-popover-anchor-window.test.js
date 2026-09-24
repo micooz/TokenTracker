@@ -141,8 +141,8 @@ test("menu-bar popover restores Tahoe glass via deferred activation with a reali
   );
   assert.match(
     source,
-    /private\s+func\s+realignPopoverWithAnchorIfDisplaced\(\)\s*\{[\s\S]*?frame\.origin\.x\s*=\s*PopoverPlacementPolicy\.originX\(/,
-    "Realign must screen-clamp the origin; hard-centering under the anchor pushes the panel off-screen near an edge.",
+    /private\s+func\s+realignPopoverWithAnchorIfDisplaced\(\)\s*\{[\s\S]*?guard\s+let\s+screen\s*=\s*anchorWindow\.screen[\s\S]*?frame\.origin\.x\s*=\s*PopoverPlacementPolicy\.originX\([\s\S]*?screenFrame:\s*screen\.frame/,
+    "Realign must screen-clamp the origin against the anchor's own screen; hard-centering or clamping against a wrong screen frame pushes the panel off-screen near an edge.",
   );
   assert.match(
     togglePopover,
