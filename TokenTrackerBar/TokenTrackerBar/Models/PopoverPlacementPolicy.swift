@@ -7,6 +7,8 @@ import CoreGraphics
 /// post-show repositioning must reproduce that contract instead of
 /// hard-centering the body under the anchor, which pushes the panel
 /// off-screen when the icon sits within half a panel width of a screen edge.
+/// Frames reaching this policy are `_NSPopoverWindow` frames, ~13pt wider
+/// per side than the visible content body.
 enum PopoverPlacementPolicy {
     /// Minimum gap kept between the panel and the screen edge.
     static let edgeInset: CGFloat = 8

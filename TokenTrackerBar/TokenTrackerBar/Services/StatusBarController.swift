@@ -925,10 +925,9 @@ final class StatusBarController: NSObject {
             }
         }
 
-        // Safety net for the level bump / child-window attach above: they run
-        // after NSPopover's own edge-fit, so a panel opened under an icon near a
-        // screen edge can end up off-screen. Re-check once the window server has
-        // committed the show; a correctly placed popover is a no-op.
+        // Edge guard: a panel opened under an icon near a screen edge can end
+        // up off-screen. Re-check once the window server has committed the
+        // show; a correctly placed popover is a no-op.
         DispatchQueue.main.async { [weak self] in
             self?.realignPopoverWithAnchorIfDisplaced()
         }
