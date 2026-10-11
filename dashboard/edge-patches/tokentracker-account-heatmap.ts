@@ -4,6 +4,7 @@
  * Level algorithm: 0 if no billable tokens, else 1..4 based on ratio to max.
  */
 import { createClient } from "npm:@insforge/sdk";
+import { cloudReadAccess, cloudFailure, cloudHistoryFailure } from "./cloud/access.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -113,6 +114,33 @@ async function verifiedUserIdFromJwt(authHeader: string | null): Promise<string 
 // account_heatmap_compact. Positional, so the model names are the only
 // repeated strings on the wire.
 type CompactDay = [string, number | string, Record<string, number | string> | null];
+interface HeatmapWire {
+  model_names: string[];
+  days: [string, number | string, (number | string)[] | null][];
+}
+
+// Expand the database-only dictionary before the existing response logic.
+// Keep values untouched here; pricing/output performs the same Number() coercion
+// as it did for the original compact RPC.
+function expandModelPairs(
+  pairs: (number | string)[] | null,
+  modelNames: (string | null)[],
+): Record<string, number | string> | null {
+  if (pairs === null) return null;
+  const entries: [string, number | string][] = [];
+  for (let i = 0; i < pairs.length; i += 2) {
+    entries.push([modelNames[Number(pairs[i])] as string, pairs[i + 1]]);
+  }
+  return Object.fromEntries(entries);
+}
+
+function decodeHeatmapWire(data: unknown): CompactDay[] {
+  const payload = (data ?? {}) as Partial<HeatmapWire>;
+  const modelNames = Array.isArray(payload.model_names) ? payload.model_names : [];
+  return (Array.isArray(payload.days) ? payload.days : []).map(([day, total, pairs]) =>
+    [day, total, expandModelPairs(pairs, modelNames)]
+  );
+}
 
 const COMPACT_TTL_MS = 30_000;
 const COMPACT_STALE_IF_ERROR_MS = 5 * 60_000;
@@ -154,7 +182,7 @@ async function fetchHeatmapCompact(
 
   const pending = (async () => {
     try {
-      const { data, error } = await client.database.rpc("account_heatmap_compact", {
+      const { data, error } = await client.database.rpc("account_heatmap_wire", {
         p_user_id: userId,
         p_device_id: requestedDeviceId,
         p_from: fromIso,
@@ -165,7 +193,7 @@ async function fetchHeatmapCompact(
         p_range_to: rangeTo,
       });
       if (error) throw new Error(error.message);
-      const days = (Array.isArray(data) ? data : []) as CompactDay[];
+      const days = decodeHeatmapWire(data);
       compactCache.set(cacheKey, { fetchedAt: Date.now(), days });
       if (compactCache.size > 64) {
         const oldest = compactCache.keys().next().value;
@@ -221,6 +249,11 @@ export default async function (req: Request): Promise<Response> {
   const userId = await verifiedUserIdFromJwt(req.headers.get("Authorization"));
   if (!userId) return json({ error: "Unauthorized" }, 401);
 
+  let cloudAccess;
+  try { cloudAccess = await cloudReadAccess(client, userId, "daily"); }
+  catch { return json({ error: "Cloud access unavailable", code: "cloud_access_unavailable" }, 503); }
+  if (!cloudAccess.ok) return cloudFailure(cloudAccess, corsHeaders);
+
   const rawDeviceId = url.searchParams.get("device_id");
   const requestedDeviceId = rawDeviceId && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawDeviceId)
     ? rawDeviceId
@@ -231,6 +264,11 @@ export default async function (req: Request): Promise<Response> {
   const end = new Date(`${toStr}T00:00:00Z`);
   const start = new Date(end);
   start.setUTCDate(start.getUTCDate() - weeks * 7 + 1);
+  const historyFailure = cloudHistoryFailure(cloudAccess, toStr);
+  if (historyFailure) return cloudFailure(historyFailure, corsHeaders);
+  if (cloudAccess.available_from && start.toISOString().slice(0, 10) < cloudAccess.available_from) {
+    start.setTime(Date.parse(`${cloudAccess.available_from}T00:00:00Z`));
+  }
   const from = start.toISOString().slice(0, 10);
   const to = toStr;
 

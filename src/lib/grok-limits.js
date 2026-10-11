@@ -4,6 +4,7 @@ const path = require("node:path");
 
 const DEFAULT_BILLING_BASE_URL = "https://cli-chat-proxy.grok.com";
 const DEFAULT_BILLING_TIMEOUT_MS = 15_000;
+const DEFAULT_SETTINGS_TIMEOUT_MS = 2_000;
 const DEFAULT_OIDC_ISSUER = "https://auth.x.ai";
 const DEFAULT_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token";
 // Refresh slightly before wall-clock expiry so Limits doesn't race a just-expired JWT.
@@ -495,9 +496,8 @@ async function resolveGrokAccessToken({
   };
 }
 
-// xAI reports the subscription as a human-readable product name on the billing
-// payload's top level (`subscriptionTier`, a sibling of `config`, not a member
-// of it) -- a Free account reads exactly "Free".
+// Grok Build enriches billing with a display tier from remote settings. The
+// billing HTTP response itself may contain only `config`.
 const GROK_PLAN_TIERS = new Map([
   ["supergrokheavy", "SuperGrok Heavy"],
   ["supergrokplus", "SuperGrok Plus"],
@@ -644,15 +644,28 @@ async function fetchGrokBilling(
       headers,
       deadlineMs,
     );
-    if (creditsResult.ok) return creditsResult.body;
-    creditsFailure = `HTTP ${creditsResult.status}`;
+    if (creditsResult.ok) {
+      // Keep the unified pool even when its fields are malformed. The caller
+      // must surface its parse error rather than substitute a legacy pool.
+      if (creditsResult.body?.config?.currentPeriod) return creditsResult.body;
+      try {
+        // Only a response without a unified period is eligible for shape
+        // fallback; a parseable legacy response can already be used as-is.
+        normalizeGrokBillingResponse(creditsResult.body);
+        return creditsResult.body;
+      } catch (error) {
+        creditsFailure = `unrecognized response (${error?.message || "invalid billing data"})`;
+      }
+    } else {
+      creditsFailure = `HTTP ${creditsResult.status}`;
+    }
   } catch (error) {
     if (error?.code === "GROK_AUTH_REQUIRED") throw error;
     if (error?.code === "GROK_BILLING_TIMEOUT") throw error;
   }
 
-  // Non-auth HTTP, network, or response-decoding failure → try the legacy
-  // shape once, while sharing the original request deadline.
+  // Non-auth HTTP, network, response-decoding, or shape failure → try the
+  // legacy shape once, while sharing the original request deadline.
   let legacyResult;
   try {
     legacyResult = await fetchGrokBillingAttempt(
@@ -673,6 +686,26 @@ async function fetchGrokBilling(
     );
   }
   return legacyResult.body;
+}
+
+async function fetchGrokPlanLabel(accessToken, { fetchImpl = fetch, env, timeoutMs } = {}) {
+  const root = resolveGrokBillingBaseUrl(env);
+  if (timeoutMs <= 0) return null;
+  try {
+    const result = await fetchGrokBillingAttempt(
+      fetchImpl,
+      `${root}/v1/settings`,
+      { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+      Date.now() + Math.min(timeoutMs || DEFAULT_SETTINGS_TIMEOUT_MS, DEFAULT_SETTINGS_TIMEOUT_MS),
+    );
+    if (!result.ok) return null;
+    return deriveGrokPlanLabel(
+      result.body?.subscription_tier_display ?? result.body?.subscription_tier,
+    );
+  } catch (_error) {
+    // A failed settings lookup must not hide a successfully fetched quota.
+    return null;
+  }
 }
 
 async function fetchGrokLimits({ home, env, fetchImpl = fetch, timeoutMs, nowMs } = {}) {
@@ -700,8 +733,10 @@ async function fetchGrokLimits({ home, env, fetchImpl = fetch, timeoutMs, nowMs 
     };
   }
 
+  const startedAtMs = Date.now();
   try {
     let body;
+    let accessToken = resolved.accessToken;
     try {
       body = await fetchGrokBilling(resolved.accessToken, { fetchImpl, env, timeoutMs });
     } catch (error) {
@@ -721,15 +756,25 @@ async function fetchGrokLimits({ home, env, fetchImpl = fetch, timeoutMs, nowMs 
         if (!retry.accessToken) {
           throw retry.error || grokReauthError();
         }
+        accessToken = retry.accessToken;
         body = await fetchGrokBilling(retry.accessToken, { fetchImpl, env, timeoutMs });
       } else {
         throw error;
       }
     }
+    const limits = normalizeGrokBillingResponse(body);
+    if (!limits.plan_label) {
+      const remainingMs = Number.isFinite(timeoutMs)
+        ? timeoutMs - (Date.now() - startedAtMs) - 100
+        : DEFAULT_SETTINGS_TIMEOUT_MS;
+      limits.plan_label = await fetchGrokPlanLabel(accessToken, {
+        fetchImpl, env, timeoutMs: remainingMs,
+      });
+    }
     return {
       configured: true,
       error: null,
-      ...normalizeGrokBillingResponse(body),
+      ...limits,
     };
   } catch (error) {
     return {

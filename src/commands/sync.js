@@ -4,8 +4,9 @@ const fs = require("node:fs/promises");
 const fssync = require("node:fs");
 const cp = require("node:child_process");
 const readline = require("node:readline");
+const { functionUrlFor, fetchFunctionResponse } = require("../lib/function-url");
 
-const { resolveInstallPaths, resolveZcodeNativeDbPath, ensureFlatCursor } = require("../lib/install-resolver");
+const { resolveInstallPaths, resolveZcodeNativeDbPath, resolveMimoNativeDbPath, ensureFlatCursor } = require("../lib/install-resolver");
 const { multiInstallParse, mergeBothFileSources } = require("../lib/multi-install-parser");
 const wsl = require("../lib/wsl-probe");
 const {
@@ -115,6 +116,8 @@ const {
   parseKilocodeIncremental,
   resolveRoocodeTaskFiles,
   parseRoocodeIncremental,
+  resolveClineSessionFilesWithStatus,
+  parseClineIncremental,
   resolveZedDbPath,
   parseZedIncremental,
   resolveLmstudioLogFiles,
@@ -133,7 +136,10 @@ const {
   resolveDroidModel,
   resolveDshSessionFiles,
   parseDshIncremental,
+  resolveCommandCodeSessionFiles,
+  parseCommandCodeIncremental,
   parseTraeCnApiIncremental,
+  parseTraeIncremental,
   bucketKey,
   toUtcHalfHourStart,
   totalsKey,
@@ -142,12 +148,19 @@ const {
 const { computeClaudeGroundTruthBuckets } = require("../lib/claude-categorizer");
 const { createProgress, renderBar, formatNumber, formatBytes } = require("../lib/progress");
 const {
+  DEFAULTS: AUTO_UPLOAD_DEFAULTS,
   normalizeState: normalizeUploadState,
   decideAutoUpload,
   recordUploadFailure,
   recordUploadSuccess,
   parseRetryAfterMs,
 } = require("../lib/upload-throttle");
+const AUTO_UPLOAD_CONFIG = {
+  intervalMs: 15 * 60_000,
+  batchSize: 200,
+  maxBatchesSmall: 5,
+  maxBatchesLarge: 5,
+};
 const { maybeSendHeartbeat } = require("../lib/telemetry");
 const {
   isCursorInstalled,
@@ -167,6 +180,15 @@ const {
   openCursorStore,
 } = require("../lib/cursor-store");
 const { resolveTrackerPaths } = require("../lib/tracker-paths");
+const { readCloudSyncEnabled } = require("../lib/cloud-sync-prefs");
+const {
+  appendUniqueDirs,
+  extraScanRootPaths,
+  hasAnyScanChild,
+  resolveEnvRoot,
+  resolveScanRoots,
+  scanRootDirState,
+} = require("../lib/scan-roots");
 const { resolveRuntimeConfig, isLegacyInsforgeBaseUrl } = require("../lib/runtime-config");
 const { extractTokenCount } = require("../lib/codex-rollout-parser");
 const {
@@ -282,6 +304,7 @@ const ZCODE_NATIVE_USAGE_REPAIR_KEY = "zcodeNativeUsageRepair_2026_08";
 const ZCODE_INCLUSIVE_TOKEN_REPAIR_KEY = "zcodeInclusiveTokenRepair_2026_09";
 const AUTO_SYNC_SOURCE_ALIASES = new Map([
   ["code", "every-code"],
+  ["commandcode", "command-code"],
   ["deepseek", "dsh"],
   ["everycode", "every-code"],
   ["kilo", "kilo-cli"],
@@ -295,8 +318,10 @@ const AUTO_SYNC_SOURCES = new Set([
   "anythingllm",
   "claude",
   "claude-science",
+  "cline",
   "codebuddy",
   "codex",
+  "command-code",
   "copilot",
   "craft",
   "cursor",
@@ -326,8 +351,10 @@ const AUTO_SYNC_SOURCES = new Set([
   "reasonix",
   "roocode",
   "trae-cn",
+  "trae",
   "unsloth",
   "workbuddy",
+  "workbuddy-ai",
   "zcode",
   "zed",
 ]);
@@ -481,6 +508,7 @@ async function clearSyncSkip(trackerDir) {
 }
 
 async function cmdSync(argv, context = {}) {
+  context = context && typeof context === "object" ? context : {};
   const opts = parseArgs(argv);
   const diagnostics = context && typeof context === "object" ? context.diagnostics : null;
   const cursorStoreOptions = context && typeof context === "object"
@@ -502,8 +530,13 @@ async function cmdSync(argv, context = {}) {
     ? context.cursorSyncDeps
     : {};
   const syncDiagnostics = diagnostics && typeof diagnostics === "object" ? diagnostics : null;
-  const home = os.homedir();
-  const { trackerDir } = await resolveTrackerPaths({ home });
+  const home = context.home || os.homedir();
+  const trackerDir = context.trackerDataDir || (await resolveTrackerPaths({ home })).trackerDir;
+  // Manual CLI sync is a one-time upload request, without changing the toggle.
+  // Hooks, native publication and detached retries must honor the saved opt-in.
+  const requiresCloudSyncPref = opts.auto || opts.background || opts.fromRetry || opts.fromNotify || opts.fromOpenclaw ||
+    Boolean(process.env.TOKENTRACKER_LOCAL_SYNC_ATTEMPT_ID);
+  const canUpload = () => !requiresCloudSyncPref || readCloudSyncEnabled(trackerDir);
 
   await ensureDir(trackerDir);
   if (opts.fromOpenclaw) {
@@ -538,7 +571,7 @@ async function cmdSync(argv, context = {}) {
     // Native publication owns backlog and failure-backoff retries on its next
     // five-minute tick. Remove any legacy detached retry marker immediately so
     // an already-sleeping retry process observes the missing marker and exits.
-    if (opts.publishAccount) {
+    if (opts.publishAccount || !canUpload()) {
       await clearAutoRetry(trackerDir);
     }
 
@@ -558,7 +591,8 @@ async function cmdSync(argv, context = {}) {
     // token unless the local API has already minted a replacement from the
     // user's current login session and passed it through the environment.
     // Ingest is a whole-row upsert per bucket key, making replay idempotent.
-    if (config && isLegacyInsforgeBaseUrl(config.baseUrl)) {
+    if (config && isLegacyInsforgeBaseUrl(config.baseUrl) &&
+        !Object.hasOwn(process.env, "TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN")) {
       const priorQueueState = (await readJson(queueStatePath)) || {};
       // Prepare the replay exactly once. The note survives successful batches,
       // so retryable failures retain both their committed offset and backoff
@@ -592,7 +626,24 @@ async function cmdSync(argv, context = {}) {
         persistedAnonKey: config.anonKey,
       };
     }
-    const codexCursorRoots = [process.env.CODEX_HOME || path.join(home, ".codex")];
+    // Scan roots (#657). Every producer — hook-fired sync, native background
+    // refresh, CLI — must derive the SAME root list, and the cursor store's
+    // codexRoots must come from that list: a rollout under a root the store
+    // does not know is filed in core.json instead of its per-day shard, so two
+    // producers with different roots never see each other's cursor and re-parse
+    // the file from byte 0 on every alternation (#639). CODEX_HOME keeps its
+    // existing meaning (replaces ~/.codex for this process) but is normalized
+    // once by resolveEnvRoot — a relative value is anchored to home, not cwd —
+    // and that single value feeds discovery AND the cursor store below.
+    // config.scanRoots adds roots for every process.
+    const codexNativeValue = resolveEnvRoot("codex", { env: process.env, home }) || path.join(home, ".codex");
+    const scanRoots = resolveScanRoots({
+      home,
+      env: process.env,
+      config,
+      base: { codex: [codexNativeValue], claude: [path.join(home, ".claude")] },
+    });
+    const codexCursorRoots = scanRoots.codex.map((entry) => entry.path);
     const cursorStore = await openCursorStore({
       trackerDir,
       cursorsPath,
@@ -634,10 +685,18 @@ async function cmdSync(argv, context = {}) {
       claudeInstallHomes.push(claudeNativeHome);
     }
     if (wslClaudeHome) claudeInstallHomes.push(wslClaudeHome);
-    const claudeProjectsDirs = claudeInstallHomes.map((h) => path.join(h, "projects"));
+    // Extra Claude roots (#657): CLAUDE_CONFIG_DIR of the spawning process and
+    // config.scanRoots.claude, additive to the homes above so coverage does not
+    // depend on which process spawned this sync. Deduped by realpath at the
+    // projects/ level: two profiles may symlink one projects/ dir, and reading
+    // it under both spellings would double-parse every file, leaving
+    // correctness to the bounded claudeHashes layer.
+    const claudeProjectsDirs = appendUniqueDirs(
+      claudeInstallHomes.map((h) => path.join(h, "projects")),
+      extraScanRootPaths(scanRoots.claude).map((h) => path.join(h, "projects")),
+    );
     const xdgDataHome = process.env.XDG_DATA_HOME || path.join(home, ".local", "share");
     const kiloHome = process.env.KILO_HOME || path.join(xdgDataHome, "kilo");
-    const mimoHome = process.env.MIMO_HOME || path.join(xdgDataHome, "mimocode");
 
     // OpenClaw session plugin integration: lifecycle hooks request an
     // OpenClaw-only auto sync so unrelated providers do not get walked.
@@ -652,6 +711,7 @@ async function cmdSync(argv, context = {}) {
     const isBackgroundAllLocalSync = isBackgroundLightweightSync && opts.allLocalSources;
     const isFullSourceScan = !autoSourceScope && !isBackgroundLightweightSync;
     const sourceAllowed = (...sources) => {
+      if (Array.isArray(context.scanSources) && !sources.some(source => context.scanSources.includes(source))) return false;
       if (isBackgroundLightweightSync) {
         if (autoSourceScope) {
           return (
@@ -692,7 +752,6 @@ async function cmdSync(argv, context = {}) {
 
     const sources = [];
     if (sourceAllowed("codex")) {
-      const codexNativeValue = process.env.CODEX_HOME || path.join(home, ".codex");
       // resolveInstallPaths stays the single authority for wsl-first /
       // native-first / wsl-only / native-only / both selection; requireAnyChild
       // makes it validate that a candidate actually holds sessions/ or
@@ -730,6 +789,17 @@ async function cmdSync(argv, context = {}) {
         sources.push({ source: "codex", sessionsDir: path.join(codexPaths.wsl, "sessions"), inventoryCacheKey: "codexDayInventoryCache" });
         if (!isBackgroundLightweightSync || backgroundCodexUsageRepair) {
           sources.push({ source: "codex", sessionsDir: path.join(codexPaths.wsl, "archived_sessions"), deep: true });
+        }
+      }
+      // Extra Codex roots (#657) from config.scanRoots.codex. Same populated-
+      // root rule as requireAnyChild above so an empty shell dir is not walked;
+      // the day-inventory cache is keyed by day directory, so sharing it across
+      // roots is safe.
+      for (const extraRoot of extraScanRootPaths(scanRoots.codex)) {
+        if (!hasAnyScanChild(extraRoot, ["sessions", "archived_sessions"])) continue;
+        sources.push({ source: "codex", sessionsDir: path.join(extraRoot, "sessions"), inventoryCacheKey: "codexDayInventoryCache" });
+        if (!isBackgroundLightweightSync || backgroundCodexUsageRepair) {
+          sources.push({ source: "codex", sessionsDir: path.join(extraRoot, "archived_sessions"), deep: true });
         }
       }
     }
@@ -915,8 +985,9 @@ async function cmdSync(argv, context = {}) {
     // Plugin-triggered sync points at one specific session file; a normal full
     // sync also passively scans every on-disk OpenClaw transcript so usage is
     // captured even when the session plugin never fires (issue #264). The scan
-    // is gated to full syncs so a scoped `--from-openclaw` hook still only
-    // touches its own file and the 5-minute background tick stays cheap. The
+    // is gated to full syncs except for gateway lifecycle signals. A scoped
+    // agent_end reads only its transcript or its session in the agent database,
+    // and the ordinary background tick stays cheap. The
     // event-identity dedup makes the plugin and passive paths idempotent, so
     // overlap on the same file is safe.
     //
@@ -930,12 +1001,22 @@ async function cmdSync(argv, context = {}) {
         path: openclawSignal.sessionFile,
         source: "openclaw",
       });
+      for (const dbPath of [
+        path.join(openclawSignal.openclawHome, "agents", openclawSignal.agentId, "agent", "openclaw-agent.sqlite"),
+        path.join(openclawSignal.openclawHome, "agents", openclawSignal.agentId, "openclaw-agent.sqlite"),
+      ]) {
+        if (!(await fs.stat(dbPath).catch(() => null))?.isFile()) continue;
+        openclawSessionFiles.set(openclawCursorKey(dbPath), {
+          path: dbPath, source: "openclaw", sessionId: openclawSignal.sessionId,
+        });
+        break;
+      }
     }
-    if (isFullSourceScan && sourceAllowed("openclaw")) {
+    if ((isFullSourceScan || (opts.fromOpenclaw && !openclawSignal)) && sourceAllowed("openclaw")) {
       try {
         for (const f of await resolveOpenclawSessionFiles(process.env)) {
           const key = openclawCursorKey(f);
-          if (!openclawSessionFiles.has(key)) {
+          if (!openclawSessionFiles.has(key) || f.endsWith(".sqlite")) {
             openclawSessionFiles.set(key, { path: f, source: "openclaw" });
           }
         }
@@ -1059,14 +1140,49 @@ async function cmdSync(argv, context = {}) {
     }
     if (isFullSourceScan) {
       await reincludeClaudeMemObserverFiles({ cursors, claudeFiles, queuePath, queueStatePath });
-      await repairClaudeQueueFromGroundTruth({
-        cursors,
-        queuePath,
-        queueStatePath,
-        projectQueuePath,
-        projectQueueStatePath,
-        rootDirs: claudeProjectsDirs,
-      });
+      // The ground-truth repair rebuilds every Claude queue row from the roots
+      // it is given. A configured root that is absent or unreadable right now
+      // (unmounted volume, permissions) may still hold history that an earlier
+      // scoped sync queued, so rebuilding without it would erase that history.
+      // The same applies one level down: listClaudeProjectFiles turns a read
+      // error on projects/ into an empty listing, so an unreadable projects/
+      // would let the repair run against nothing and mark itself complete. An
+      // ABSENT projects/ is fine for a NEW root (a profile with no sessions
+      // yet) but not for one the cursor store shows has supplied files before:
+      // then the directory vanished and rebuilding without it would erase its
+      // history. Defer in both cases: the migration key stays unset and the
+      // repair runs on a later full scan once the root is back. Ordinary
+      // scanning still proceeds.
+      const cursorFilePaths = Object.keys(cursors.files || {});
+      const rootPreviouslySuppliedFiles = (rootPath) => {
+        const prefix = path.join(rootPath, "projects") + path.sep;
+        return cursorFilePaths.some((filePath) => filePath.startsWith(prefix));
+      };
+      const unavailableClaudeRoots = scanRoots.claude
+        .filter((entry) => {
+          if (entry.origin === "native") return false;
+          if (!entry.exists) return true;
+          const projectsState = scanRootDirState(path.join(entry.path, "projects"));
+          if (projectsState.error !== null) return true;
+          return !projectsState.exists && rootPreviouslySuppliedFiles(entry.path);
+        })
+        .map((entry) => entry.path);
+      if (unavailableClaudeRoots.length > 0) {
+        if (!opts.auto) {
+          process.stderr.write(
+            `Claude ground-truth repair deferred: configured scan root(s) unavailable: ${unavailableClaudeRoots.join(", ")}\n`,
+          );
+        }
+      } else {
+        await repairClaudeQueueFromGroundTruth({
+          cursors,
+          queuePath,
+          queueStatePath,
+          projectQueuePath,
+          projectQueueStatePath,
+          rootDirs: claudeProjectsDirs,
+        });
+      }
     }
     let claudeResult = { filesProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
     if (claudeFiles.length > 0) {
@@ -1233,17 +1349,13 @@ async function cmdSync(argv, context = {}) {
       });
 
       const parseOpencodeForInstall = async (options) => {
-        const { storageDir, dbDir, cursors } = options;
+        const { dbDir, cursors, messageFiles } = options;
         let filesResult = { filesProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
-        if (storageDir) {
-          const storagePath = path.join(storageDir, "storage");
-          const messageFiles = await listOpencodeMessageFiles(storagePath);
-          if (messageFiles.length > 0) {
-            filesResult = await parseOpencodeIncremental({
-              ...options,
-              messageFiles,
-            });
-          }
+        if (messageFiles.length > 0) {
+          filesResult = await parseOpencodeIncremental({
+            ...options,
+            messageFiles,
+          });
         }
 
         let dbResult = { messagesProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
@@ -1259,6 +1371,7 @@ async function cmdSync(argv, context = {}) {
               dbMessages: dbRead.messages,
               dbCursor: dbRead.cursor,
               dbPath,
+              opencodeCursorStore: cursorStore,
             });
           }
         }
@@ -1274,26 +1387,57 @@ async function cmdSync(argv, context = {}) {
         native: storagePaths.native || dbPaths.native,
         wsl: storagePaths.wsl || dbPaths.wsl,
       };
+      const installKeys = Object.keys(opencodePaths).filter((key) => opencodePaths[key]);
+      const messageFilesByInstall = {};
+      for (const key of installKeys) {
+        messageFilesByInstall[key] = storagePaths[key]
+          ? await listOpencodeMessageFiles(path.join(storagePaths[key], "storage"))
+          : [];
+      }
+      const storedOpencode = cursors.opencode;
+      const storedNamespaced = Boolean(
+        storedOpencode &&
+        typeof storedOpencode === "object" &&
+        (storedOpencode.native !== undefined || storedOpencode.wsl !== undefined),
+      );
+      if (
+        storedNamespaced !== (installKeys.length > 1) ||
+        Object.values(messageFilesByInstall).some((files) => files.length > 0)
+      ) {
+        await cursorStore.materializeAllOpencodeState();
+      }
 
-      const multiResult = await multiInstallParse({
-        paths: opencodePaths,
-        parserFn: parseOpencodeForInstall,
-        providerName: "opencode",
-        cursors,
-        queuePath,
-        projectQueuePath,
-        getParams: (p, key) => ({ storageDir: storagePaths[key], dbDir: dbPaths[key] }),
-        onProgress: (p) => {
-          if (!progress?.enabled) return;
-          const pct = p.total > 0 ? p.index / p.total : 1;
-          progress.update(
-            `Parsing Opencode (${p.install || "default"}) ${renderBar(pct)} ${formatNumber(
-              p.index,
-            )}/${formatNumber(p.total)} | buckets ${formatNumber(p.bucketsQueued)}`,
-          );
-        },
-        source: "opencode",
-      });
+      let multiResult;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          multiResult = await multiInstallParse({
+            paths: opencodePaths,
+            parserFn: parseOpencodeForInstall,
+            providerName: "opencode",
+            cursors,
+            queuePath,
+            projectQueuePath,
+            getParams: (_p, key) => ({
+              dbDir: dbPaths[key],
+              messageFiles: messageFilesByInstall[key] || [],
+              opencodeCursorNamespace: installKeys.length > 1 ? key : "flat",
+            }),
+            onProgress: (p) => {
+              if (!progress?.enabled) return;
+              const pct = p.total > 0 ? p.index / p.total : 1;
+              progress.update(
+                `Parsing Opencode (${p.install || "default"}) ${renderBar(pct)} ${formatNumber(
+                  p.index,
+                )}/${formatNumber(p.total)} | buckets ${formatNumber(p.bucketsQueued)}`,
+              );
+            },
+            source: "opencode",
+          });
+          break;
+        } catch (error) {
+          if (!isCursorStoreRetry(error) || attempt > 0) throw error;
+        }
+      }
 
       opencodeResult = {
         filesProcessed: multiResult.recordsProcessed,
@@ -1547,9 +1691,7 @@ async function cmdSync(argv, context = {}) {
     // double-counting usage already counted as source=claude.
     let mimoResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
     if (sourceAllowed("mimo")) {
-      const mimoNativeValue = process.platform === "win32" && typeof process.env.APPDATA === "string"
-        ? path.join(process.env.APPDATA.trim(), "mimocode", "mimocode.db")
-        : path.join(mimoHome, "mimocode.db");
+      const mimoNativeValue = resolveMimoNativeDbPath({ home });
       const wslMimoDir = process.platform === "win32" && wsl.shouldProbeWsl(process.env)
         ? wsl.discoverWslHome(".local/share/mimocode")
         : null;
@@ -1647,6 +1789,34 @@ async function cmdSync(argv, context = {}) {
         } catch (err) {
           warnProviderParseFailure("DeepSeek Harness", err, opts);
         }
+      }
+    }
+
+    // ── Command Code (`cmd`) — passive read of ~/.commandcode session logs ──
+    let commandCodeResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    if (sourceAllowed("command-code")) {
+      try {
+        const commandCodeSessionFiles = await resolveCommandCodeSessionFiles(process.env);
+        // Empty discovery preserves durable usage history. Native I/O failures
+        // remain visible; optional WSL failures do not suppress native usage.
+        if (commandCodeSessionFiles.length > 0 || cursors.commandCode) {
+          if (progress?.enabled) {
+            progress.start(
+              `Parsing Command Code ${renderBar(0)} 0/${formatNumber(
+                commandCodeSessionFiles.length,
+              )} sessions | buckets 0`,
+            );
+          }
+          commandCodeResult = await parseCommandCodeIncremental({
+            sessionFiles: commandCodeSessionFiles,
+            cursors,
+            queuePath,
+            projectQueuePath,
+            onProgress: makeProviderProgress("Command Code"),
+          });
+        }
+      } catch (err) {
+        warnProviderParseFailure("Command Code", err, opts);
       }
     }
 
@@ -1892,6 +2062,40 @@ async function cmdSync(argv, context = {}) {
       }
     }
 
+    // ── Cline (CLI v3 / desktop app — ~/.cline/data/sessions) ──
+    let clineResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    if (sourceAllowed("cline")) {
+      try {
+        const clineScan = resolveClineSessionFilesWithStatus(process.env);
+        const clineSessionFiles = clineScan.files;
+        for (const failure of clineScan.errors) {
+          warnProviderParseFailure("Cline", failure.error, opts);
+        }
+        if (progress?.enabled && clineSessionFiles.length > 0) {
+          progress.start(
+            `Parsing Cline ${renderBar(0)} 0/${formatNumber(clineSessionFiles.length)} transcripts | buckets 0`,
+          );
+        }
+        clineResult = await parseClineIncremental({
+          sessionFiles: clineSessionFiles,
+          scanCompleteRoots: clineScan.completedRoots,
+          cursors,
+          queuePath,
+          onProgress: (p) => {
+            if (!progress?.enabled) return;
+            const pct = p.total > 0 ? p.index / p.total : 1;
+            progress.update(
+              `Parsing Cline ${renderBar(pct)} ${formatNumber(p.index)}/${formatNumber(
+                p.total,
+              )} transcripts | buckets ${formatNumber(p.bucketsQueued)}`,
+            );
+          },
+        });
+      } catch (err) {
+        warnProviderParseFailure("Cline", err, opts);
+      }
+    }
+
     // ── Cursor (API-based) ──
     // One-time migration: earlier CLI versions mis-parsed the Cursor CSV after
     // Cursor inserted new "Cloud Agent ID"/"Automation ID" columns, writing
@@ -1943,6 +2147,27 @@ async function cmdSync(argv, context = {}) {
           }
         }
       }
+    }
+
+    let traeResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    if (sourceAllowed("trae")) {
+      try {
+        traeResult = await parseTraeIncremental({
+          cursors, queuePath, onProgress: makeProviderProgress("TRAE"),
+        });
+        for (const { database, message } of traeResult.errors) {
+          process.stderr.write(`TRAE sync: could not read ${database}: ${message}. Will retry on the next sync.\n`);
+        }
+        if (traeResult.recordsSkipped > 0 && !opts.auto) {
+          process.stderr.write(`TRAE sync: skipped ${traeResult.recordsSkipped} records with unsupported usage metadata.\n`);
+        }
+        if (traeResult.estimatedRecords > 0 && !opts.auto) {
+          process.stderr.write(`TRAE sync: ${traeResult.estimatedRecords} Gemini records have repaired thought or cache counters, marked as estimated.\n`);
+        }
+        if (traeResult.unpricedRecords > 0 && !opts.auto) {
+          process.stderr.write(`TRAE sync: ${traeResult.unpricedRecords} multi-request turns include earlier input without a cache split; it is counted in token totals but left out of cost.\n`);
+        }
+      } catch (err) { warnProviderParseFailure("TRAE", err); }
     }
 
     // ── Trae Work CN (国内版) — account-level usage API ──
@@ -2381,6 +2606,42 @@ async function cmdSync(argv, context = {}) {
         });
       } catch (err) {
         warnProviderParseFailure("WorkBuddy", err, opts);
+      }
+    }
+
+    // ── WorkBuddy AI — international build (~/.workbuddy-ai/projects/**/*.jsonl) ──
+    // Same Claude-fork family and byte-identical JSONL as the CN build above;
+    // only the home directory differs, so it reuses the WorkBuddy parser and
+    // gets its own source key (and cursor namespace) so the two builds stay
+    // separable instead of merging into one provider row.
+    let workbuddyAiResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    const workbuddyAiFiles = sourceAllowed("workbuddy-ai")
+      ? mergeBothFileSources({
+          resolveFiles: (resolveEnv) => resolveWorkbuddyProjectFiles(resolveEnv, "workbuddy-ai"),
+          env: process.env,
+        })
+      : [];
+    if (sourceAllowed("workbuddy-ai")) {
+      if (progress?.enabled) {
+        progress.start(`Parsing WorkBuddy AI ${renderBar(0)} | buckets 0`);
+      }
+      try {
+        workbuddyAiResult = await parseWorkbuddyIncremental({
+          projectFiles: workbuddyAiFiles,
+          cursors,
+          queuePath,
+          env: process.env,
+          source: "workbuddy-ai",
+          onProgress: (p) => {
+            if (!progress?.enabled) return;
+            const pct = p.total > 0 ? p.index / p.total : 1;
+            progress.update(
+              `Parsing WorkBuddy AI ${renderBar(pct)} ${formatNumber(p.index)}/${formatNumber(p.total)} files | buckets ${formatNumber(p.bucketsQueued)}`,
+            );
+          },
+        });
+      } catch (err) {
+        warnProviderParseFailure("WorkBuddy AI", err, opts);
       }
     }
 
@@ -3035,6 +3296,7 @@ async function cmdSync(argv, context = {}) {
       claudeScienceResult.recordsProcessed +
       cursorResult.recordsProcessed +
       traeCnResult.recordsProcessed +
+      traeResult.recordsProcessed +
       kiroResult.recordsProcessed +
       kiroCliResult.recordsProcessed +
       hermesResult.recordsProcessed +
@@ -3042,6 +3304,7 @@ async function cmdSync(argv, context = {}) {
       kimiCodeResult.recordsProcessed +
       codebuddyResult.recordsProcessed +
       workbuddyResult.recordsProcessed +
+      workbuddyAiResult.recordsProcessed +
       ompResult.recordsProcessed +
       omoResult.recordsProcessed +
       piResult.recordsProcessed +
@@ -3060,9 +3323,11 @@ async function cmdSync(argv, context = {}) {
       zcodeResult.recordsProcessed +
       kilocodeResult.recordsProcessed +
       roocodeResult.recordsProcessed +
+      clineResult.recordsProcessed +
       zedResult.recordsProcessed +
       gooseResult.recordsProcessed +
       dshResult.recordsProcessed +
+      commandCodeResult.recordsProcessed +
       droidResult.recordsProcessed;
     const totalBuckets =
       parseResult.bucketsQueued +
@@ -3076,6 +3341,7 @@ async function cmdSync(argv, context = {}) {
       claudeScienceResult.bucketsQueued +
       cursorResult.bucketsQueued +
       traeCnResult.bucketsQueued +
+      traeResult.bucketsQueued +
       kiroResult.bucketsQueued +
       kiroCliResult.bucketsQueued +
       hermesResult.bucketsQueued +
@@ -3083,6 +3349,7 @@ async function cmdSync(argv, context = {}) {
       kimiCodeResult.bucketsQueued +
       codebuddyResult.bucketsQueued +
       workbuddyResult.bucketsQueued +
+      workbuddyAiResult.bucketsQueued +
       ompResult.bucketsQueued +
       omoResult.bucketsQueued +
       piResult.bucketsQueued +
@@ -3101,18 +3368,22 @@ async function cmdSync(argv, context = {}) {
       zcodeResult.bucketsQueued +
       kilocodeResult.bucketsQueued +
       roocodeResult.bucketsQueued +
+      clineResult.bucketsQueued +
       zedResult.bucketsQueued +
       gooseResult.bucketsQueued +
       dshResult.bucketsQueued +
+      commandCodeResult.bucketsQueued +
       droidResult.bucketsQueued;
     const skipNoOpCursorCommit =
       opts.auto &&
       !isFullSourceScan &&
       cursorStore.mode === "v2" &&
       cursorStore.requiresCommit !== true &&
-      totalParsed === 0 &&
+      totalParsed === (commandCodeResult.cursorUnchanged ? commandCodeResult.recordsProcessed : 0) &&
       totalBuckets === 0 &&
       !(grokResult.projectBucketsQueued > 0) &&
+      !(commandCodeResult.projectBucketsQueued > 0) &&
+      !commandCodeResult.schemaMigrated &&
       !codexColdAuditDue &&
       !codexFallbackRetryRan &&
       !grokHookSignalConsumed &&
@@ -3153,39 +3424,70 @@ async function cmdSync(argv, context = {}) {
     if (legacyBaseUrlMigration?.replacementDeviceToken) {
       runtimeConfig.deviceToken = legacyBaseUrlMigration.replacementDeviceToken;
     }
-    const runtime = resolveRuntimeConfig({ config: runtimeConfig, env: process.env });
+    // An authenticated local API supplies this capability for this upload.
+    // Keep a separately configured CLI account from overriding its owner.
+    const resolvedRuntime = resolveRuntimeConfig({
+      cli: {
+        deviceToken: process.env.TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN,
+        ...(process.env.TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN ? {
+          baseUrl: process.env.TOKENTRACKER_INSFORGE_BASE_URL,
+          anonKey: process.env.TOKENTRACKER_INSFORGE_ANON_KEY,
+        } : {}),
+      },
+      config: runtimeConfig,
+      env: process.env,
+    });
+
+    // Empty is an explicit local-server denial, so it cannot fall back to a
+    // separately configured CLI account when the browser is signed out.
+    const runtime = Object.hasOwn(process.env, "TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN")
+      ? { ...resolvedRuntime, deviceToken: resolvedRuntime.configurationError ? null : process.env.TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN }
+      : resolvedRuntime;
 
     let uploadResult = { inserted: 0, skipped: 0 };
     let uploadAttempted = false;
     let autoUploadDecision = null;
 
-    if (opts.publishAccount || (legacyBaseUrlMigration && opts.auto)) {
+    if (canUpload() && (opts.auto || opts.publishAccount) && runtime.deviceToken && runtime.baseUrl &&
+        (!isBackgroundLightweightSync || opts.publishAccount)) {
       const uploadStateBefore = (await readJson(queueStatePath)) || { offset: 0 };
       const queueSizeBefore = await safeStatSize(queuePath);
       const pendingBytesBefore = Math.max(
         0,
         queueSizeBefore - Number(uploadStateBefore.offset || 0),
       );
-      // Native publication and every auto-triggered legacy migration share the
-      // failure-backoff gate. Intentionally ignore the 30-minute success
-      // throttle: native refresh owns its own cadence, while a pending migration
-      // should complete as soon as a credential becomes usable.
+      // Automatic producers honor success and failure deadlines. A verified
+      // manual recheck may probe changed membership; the server decides access.
+      const bypassSuccessInterval = (!opts.auto && opts.drain) || legacyBaseUrlMigration;
+      const lastSuccessMs = Number(uploadThrottleState.lastSuccessMs || 0);
+      const successDeadline = lastSuccessMs > 0
+        ? Math.max(Number(uploadThrottleState.serverNextAllowedAtMs || 0), Math.min(Number(uploadThrottleState.nextAllowedAtMs || 0),
+          lastSuccessMs + AUTO_UPLOAD_CONFIG.intervalMs + AUTO_UPLOAD_DEFAULTS.jitterMsMax))
+        : Number(uploadThrottleState.nextAllowedAtMs || 0);
+      const recheckCloudAccess = opts.drain && process.env.TOKENTRACKER_CLOUD_RECHECK === "1" &&
+        Boolean(process.env.TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN?.trim());
+      const storedBackoff = recheckCloudAccess ? 0 : Number(uploadThrottleState.backoffUntilMs || 0);
       autoUploadDecision = decideAutoUpload({
         nowMs: Date.now(),
         pendingBytes: pendingBytesBefore,
         state: {
           ...uploadThrottleState,
-          nextAllowedAtMs: Number(uploadThrottleState.backoffUntilMs || 0),
+          backoffUntilMs: storedBackoff,
+          nextAllowedAtMs: recheckCloudAccess ? 0 : bypassSuccessInterval
+            ? Math.max(storedBackoff, Number(uploadThrottleState.serverNextAllowedAtMs || 0))
+            : successDeadline,
         },
-        config: {
-          batchSize: 200,
-          maxBatchesSmall: 5,
-          maxBatchesLarge: 5,
-        },
+        config: AUTO_UPLOAD_CONFIG,
       });
+      if (opts.drain && autoUploadDecision.reason === "throttled") {
+        throw Object.assign(new Error("Cloud upload is backed off; retry after the current upload cooldown"), {
+          code: "SYNC_UPLOAD_BACKOFF",
+          retryAfterMs: Math.max(0, autoUploadDecision.blockedUntilMs - Date.now()),
+        });
+      }
     }
 
-    if (runtime.deviceToken && runtime.baseUrl &&
+    if (canUpload() && runtime.deviceToken && runtime.baseUrl &&
         (!isBackgroundLightweightSync || opts.publishAccount) &&
         (!autoUploadDecision || autoUploadDecision.allowed)) {
       uploadAttempted = true;
@@ -3209,6 +3511,7 @@ async function cmdSync(argv, context = {}) {
             queueStatePath,
             maxBatches: opts.drain ? 100 : (autoUploadDecision?.maxBatches || 5),
             batchSize: autoUploadDecision?.batchSize || 200,
+            canUpload,
           });
         try {
           uploadResult = await drainWithToken(successfulDeviceToken);
@@ -3217,6 +3520,7 @@ async function cmdSync(argv, context = {}) {
           const replacementDeviceToken = legacyBaseUrlMigration?.replacementDeviceToken;
           const stateAfterFailure = (await readJson(queueStatePath)) || { offset: 0 };
           const canFallbackWithoutSplittingHistory =
+            !Object.hasOwn(process.env, "TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN") &&
             (error?.status === 401 || error?.status === 403) &&
             replacementDeviceToken &&
             fallbackDeviceToken &&
@@ -3255,11 +3559,16 @@ async function cmdSync(argv, context = {}) {
         }
         // Record success so the exponential backoff step resets — otherwise
         // a single past failure keeps us pessimistically throttled forever.
-        uploadThrottleState = recordUploadSuccess({
-          nowMs: Date.now(),
-          state: uploadThrottleState,
-        });
-        await writeJson(uploadThrottlePath, uploadThrottleState);
+        if (uploadResult.batches > 0) {
+          uploadThrottleState = recordUploadSuccess({
+            nowMs: Date.now(),
+            state: uploadThrottleState,
+            config: AUTO_UPLOAD_CONFIG,
+            cloudAccess: uploadResult.cloudAccess,
+            attemptId: process.env.TOKENTRACKER_LOCAL_SYNC_ATTEMPT_ID,
+          });
+          await writeJson(uploadThrottlePath, uploadThrottleState);
+        }
       } catch (e) {
         // Persist a backoff on 429 / 5xx so the next auto-sync waits instead
         // of retrying immediately and making the rate-limit worse. The
@@ -3269,6 +3578,7 @@ async function cmdSync(argv, context = {}) {
           nowMs: Date.now(),
           state: uploadThrottleState,
           error: e,
+          attemptId: process.env.TOKENTRACKER_LOCAL_SYNC_ATTEMPT_ID,
         });
         await writeJson(uploadThrottlePath, uploadThrottleState);
         if (!opts.auto) {
@@ -3288,7 +3598,7 @@ async function cmdSync(argv, context = {}) {
     // and can keep auto retry alive even after cloud sync has drained.
     const pendingBytes = Math.max(0, queueSize - Number(afterState.offset || 0));
 
-    if (pendingBytes <= 0) {
+    if (pendingBytes <= 0 || !canUpload()) {
       await clearAutoRetry(trackerDir);
     } else if (opts.auto && uploadAttempted && !opts.publishAccount) {
       const retryAtMs = Number(uploadThrottleState?.nextAllowedAtMs || 0);
@@ -3942,12 +4252,14 @@ const AUTO_RETRY_MAX_DELAY_MS = 2 * 60 * 60 * 1000;
 const INGEST_SLUG = "tokentracker-ingest";
 const MAX_INGEST_BUCKETS = 500;
 
-async function drainQueueToCloud({ baseUrl, anonKey, deviceToken, queuePath, queueStatePath, maxBatches = 5, batchSize = 200 }) {
+async function drainQueueToCloud({ baseUrl, anonKey, deviceToken, queuePath, queueStatePath, maxBatches = 5, batchSize = 200, canUpload = () => true }) {
   const state = (await readJson(queueStatePath)) || { offset: 0 };
   let offset = Number(state.offset || 0);
   let inserted = 0;
   let skipped = 0;
   let batches = 0;
+  let cloudAccess = null;
+  const uploadId = crypto.randomUUID();
 
   const queueSize = await safeStatSize(queuePath);
   const limit = Math.min(Math.max(1, Math.floor(Number(batchSize || 200))), MAX_INGEST_BUCKETS);
@@ -3967,10 +4279,13 @@ async function drainQueueToCloud({ baseUrl, anonKey, deviceToken, queuePath, que
       Authorization: `Bearer ${deviceToken}`,
     };
     if (anonKey) headers.apikey = anonKey;
-    const res = await fetch(`${root}/functions/${INGEST_SLUG}`, {
+    // Re-read after parsing/each batch so switching off stops an active drain.
+    if (!canUpload()) break;
+    const res = await fetchFunctionResponse(functionUrlFor(root, INGEST_SLUG), {
       method: "POST",
       headers,
       body: JSON.stringify({
+        upload_id: uploadId,
         hourly: result.buckets,
         ...(result.sessionStates.length > 0
           ? { account_session_states: result.sessionStates }
@@ -3984,12 +4299,16 @@ async function drainQueueToCloud({ baseUrl, anonKey, deviceToken, queuePath, que
     if (!res.ok) {
       const err = new Error(`HTTP ${res.status}: ${rawText.substring(0, 500)}`);
       err.status = res.status;
+      err.code = res.status === 401 ? "CLOUD_DEVICE_TOKEN_REJECTED"
+        : typeof data?.code === "string" ? data.code
+          : res.status === 403 ? "CLOUD_UPLOAD_FORBIDDEN" : "CLOUD_UPLOAD_FAILED";
       const retryAfter = res.headers?.get?.("Retry-After") ?? null;
       const retryAfterMs = parseRetryAfterMs(retryAfter);
       if (retryAfterMs !== null) err.retryAfterMs = retryAfterMs;
       throw err;
     }
 
+    cloudAccess = data;
     inserted += Number(data?.inserted || 0);
     skipped += Number(data?.skipped || 0);
     batches += 1;
@@ -4000,7 +4319,7 @@ async function drainQueueToCloud({ baseUrl, anonKey, deviceToken, queuePath, que
     await writeJson(queueStatePath, state);
   }
 
-  return { inserted, skipped, batches };
+  return { inserted, skipped, batches, ...(cloudAccess?.next_allowed_at ? { cloudAccess } : {}) };
 }
 
 async function readQueueBatch(queuePath, startOffset, maxBuckets) {

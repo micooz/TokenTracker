@@ -28,11 +28,20 @@ const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
-const { listClaudeProjectFiles, listRolloutFilesDeep, claudeMessageDedupKey } = require("./rollout");
+const { listClaudeProjectFiles, listRolloutFilesDeep, claudeMessageDedupKey, normalizeClaudeUsage } = require("./rollout");
 const { parseCodexRolloutFile } = require("./codex-rollout-parser");
-const { computeRowCost, getModelPricing } = require("./pricing");
+const { computeRowCost, getModelPricingInfo } = require("./pricing");
+const { normalizePerformance, mergePerformance, createClaudePerformanceCollector, createCodexPerformanceCollector } = require("./session-performance");
 const { USD_TICKS_PER_USD, normalizeGrokUsage } = require("./grok-usage");
 const wsl = require("./wsl-probe");
+const {
+  appendUniqueDirs,
+  dedupeDirsByRealpath,
+  expandHome,
+  loadScanRootsConfig,
+  normalizeScanRootsConfig,
+  scanRootDirState,
+} = require("./scan-roots");
 
 // Bump the sidecar when derived metrics change so cached rows are rebuilt
 // instead of leaving the dashboard on the previous (over-counted) heuristic.
@@ -60,7 +69,8 @@ const wsl = require("./wsl-probe");
 // v13 stores per-model Codex usage (including observed reroutes and the exact
 // long-context subset) and folds delivery signals into the token parser's
 // single pass instead of parsing every Codex file twice.
-const SIDECAR_VERSION = 13;
+// v14 adds request-level estimated performance and Claude model usage.
+const SIDECAR_VERSION = 16;
 const EDIT_TOOLS = new Set([
   "apply_patch",
   "edit",
@@ -113,10 +123,21 @@ function addTotals(target, delta) {
   for (const key of ["input_tokens", "cached_input_tokens", "cache_creation_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"]) {
     target[key] = finite(target[key]) + finite(delta?.[key]);
   }
+  for (const key of MODEL_USAGE_SUM_FIELDS) {
+    if (!/^(?:long_context_|priority_)|^(?:usage_events|rerouted_usage_events)$/.test(key)) continue;
+    if (delta?.[key]) target[key] = finite(target[key]) + finite(delta[key]);
+  }
 }
 
 function emptyTotals() {
   return tokenTotals({});
+}
+
+function mergeUsageMetadata(target, usage) {
+  for (const field of ["selected_models", "reroute_reasons"]) {
+    if (Array.isArray(usage[field])) target[field] = [...new Set([...(target[field] || []), ...usage[field]])];
+  }
+  if (usage.model_attribution === "effective") target.model_attribution = "effective";
 }
 
 const MODEL_USAGE_SUM_FIELDS = [
@@ -164,10 +185,12 @@ function normalizeModelUsageRows(rows) {
         selected_models: new Set(),
         reroute_reasons: new Set(),
         model_attribution: "selected",
+        performance: normalizePerformance(),
       };
       byModel.set(model, row);
     }
     for (const field of MODEL_USAGE_SUM_FIELDS) row[field] += finite(value?.[field]);
+    row.performance = mergePerformance(row.performance, value?.performance);
     if (Array.isArray(value?.selected_models)) {
       for (const selected of value.selected_models) {
         const normalized = normalizeSessionModel(selected);
@@ -187,6 +210,8 @@ function normalizeModelUsageRows(rows) {
     }
   }
   return [...byModel.values()]
+    .filter((row) => ["total_tokens", "input_tokens", "cached_input_tokens", "cache_creation_input_tokens", "output_tokens", "reasoning_output_tokens"]
+      .some((field) => row[field] > 0))
     .map((row) => ({
       ...row,
       selected_models: [...row.selected_models].sort(),
@@ -197,9 +222,9 @@ function normalizeModelUsageRows(rows) {
 
 // The sidecar is re-read on every dashboard request, so keep it small: omit
 // the model_usage fields that normalizeModelUsageRows() reconstructs on read.
-// All four omissions are lossless - zero counters default to 0, an absent
+// These omissions are lossless - zero counters default to 0, an absent
 // selected_models re-seeds from `model`, model_attribution is derived from
-// rerouted_usage_events, and cost_usd is always recomputed by
+// rerouted_usage_events, and cost_usd/pricing are always recomputed by
 // repriceSessionRecord(). Worth ~19% of the file on a 6.8k-session history,
 // most of it the long_context_* counters for sessions with no requests over
 // OPENAI_LONG_CONTEXT_INPUT_THRESHOLD in src/lib/pricing/index.js.
@@ -215,6 +240,7 @@ function serializeModelUsageRow(row) {
     out.reroute_reasons = row.reroute_reasons;
   }
   if (row.model_attribution === "effective") out.model_attribution = "effective";
+  if (row.performance?.estimated_request_count || row.performance?.first_response_sample_count) out.performance = row.performance;
   return out;
 }
 
@@ -226,27 +252,32 @@ function serializeSessionRecord(row) {
 }
 
 function repriceSessionRecord(record) {
+  if (Array.isArray(record.usage_buckets)) {
+    record.usage_buckets = record.usage_buckets.map((bucket) => ({
+      ...bucket, cost_usd: computeRowCost({ source: record.source, ...bucket }),
+    }));
+  }
   const modelUsage = normalizeModelUsageRows(record?.model_usage);
   if (modelUsage.length > 0) {
     let hasUnpricedUsage = false;
     for (const row of modelUsage) {
       row.cost_usd = computeRowCost({ source: record.source, ...row });
-      if (record.source === "codex" && row.total_tokens > 0) {
-        const pricing = getModelPricing(row.model, { source: record.source });
-        if (![pricing.input, pricing.output, pricing.cache_read, pricing.cache_write]
-          .some((value) => finite(value) > 0)) {
-          hasUnpricedUsage = true;
-        }
-      }
+      row.pricing = getModelPricingInfo(row.model, { source: record.source });
+      if (row.total_tokens > 0 && row.pricing.status === "unpriced") hasUnpricedUsage = true;
     }
     record.model_usage = modelUsage;
     record.model = modelUsage.length > 1 ? "mixed" : modelUsage[0].model;
-    record.cost_usd = modelUsage.reduce((sum, row) => sum + finite(row.cost_usd), 0);
-    record.cost_source = "model_pricing";
+    if (record.cost_source === "provider_reported" && Number.isFinite(Number(record.provider_cost_usd)) && Number(record.provider_cost_usd) >= 0) {
+      record.cost_usd = Number(record.provider_cost_usd);
+      if (modelUsage.length === 1) modelUsage[0].cost_usd = record.cost_usd;
+    } else {
+      record.cost_usd = modelUsage.reduce((sum, row) => sum + finite(row.cost_usd), 0);
+      record.cost_source = "model_pricing";
+      record.cost_is_partial = hasUnpricedUsage;
+    }
     // Internal labels such as `codex-auto-review` expose token usage but not
     // an underlying public model/rate. Keep their tokens, leave their cost at
     // zero, and explicitly mark the session estimate as a known lower bound.
-    record.cost_is_partial = hasUnpricedUsage;
   } else {
     const providerCost = Number(record.provider_cost_usd);
     record.cost_usd = record.cost_source === "provider_reported"
@@ -254,6 +285,8 @@ function repriceSessionRecord(record) {
       && providerCost >= 0
       ? providerCost
       : computeRowCost({ source: record.source, model: record.model, ...record.tokens });
+    if (record.cost_source !== "provider_reported" && finite(record.total_tokens || record.tokens?.total_tokens) > 0
+      && getModelPricingInfo(record.model, { source: record.source }).status === "unpriced") record.cost_is_partial = true;
   }
   record.cost_per_edit = record.edit_turns > 0 ? record.cost_usd / record.edit_turns : null;
   return record;
@@ -262,7 +295,7 @@ function repriceSessionRecord(record) {
 // The model_usage wire contract is DENSE: every field dashboard/src/lib/
 // sessions-api.ts declares is present on every row. Storage is free to be
 // sparse - serializeModelUsageRow() drops zero counters, and a record with no
-// model_usage at all (every claude/grok session, plus codex sessions written
+// model_usage at all (Grok sessions and sessions written
 // by an older sidecar) has nothing to trim in the first place - but neither
 // shape may leak into an API response, or the declared type describes a row
 // that does not exist. Densify here, the one point both the by_model
@@ -275,6 +308,7 @@ function denseModelUsageRow(overrides = {}) {
     reroute_reasons: [],
     model_attribution: "selected",
     cost_usd: 0,
+    performance: normalizePerformance(),
     ...overrides,
   };
 }
@@ -285,17 +319,22 @@ function modelUsageForAggregation(record) {
   if (rows.length === 0) {
     return [denseModelUsageRow({
       model: normalizeSessionModel(record?.model) || "unknown",
+      ...record?.tokens,
       total_tokens: finite(record?.total_tokens || record?.tokens?.total_tokens),
       cost_usd: finite(record?.cost_usd),
       edit_turns: editTurns,
+      performance: normalizePerformance(record?.performance),
+      pricing: getModelPricingInfo(record?.model, { source: record?.source }),
     })];
   }
   const priced = rows.map((row) => denseModelUsageRow({
     ...row,
+    pricing: getModelPricingInfo(row.model, { source: record.source }),
     cost_usd: Number.isFinite(Number(row.cost_usd))
       ? Number(row.cost_usd)
       : computeRowCost({ source: record.source, ...row }),
   }));
+  if (record.cost_source === "provider_reported" && priced.length === 1) priced[0].cost_usd = finite(record.cost_usd);
   // Sum(rows.edit_turns) has to equal record.edit_turns or the by_model column
   // stops summing to summary.edit_turns. It can fall short two ways: a sidecar
   // written before model_usage carried edit_turns, and an edit turn whose model
@@ -433,6 +472,7 @@ function finalizeRecord(record) {
   record.active_ms = Math.max(0, finite(record.active_ms));
   record.duration_ms = record.active_ms;
   record.total_tokens = finite(record.total_tokens || record.tokens?.total_tokens);
+  record.performance = normalizePerformance(record.performance);
   repriceSessionRecord(record);
   record.productive = record.edit_turns > 0;
   // A first-pass delivery has exactly one user turn containing an observed
@@ -443,6 +483,19 @@ function finalizeRecord(record) {
   record.tokens_per_edit = record.edit_turns > 0 ? record.total_tokens / record.edit_turns : null;
   record.cost_per_edit = record.edit_turns > 0 ? record.cost_usd / record.edit_turns : null;
   return record;
+}
+
+function sessionStorageUsage(filePaths) {
+  let bytes = 0;
+  const allocated = process.platform !== "win32";
+  for (const file of new Set(filePaths)) {
+    try {
+      const stat = fs.statSync(file);
+      if (!stat.isFile()) continue;
+      bytes += allocated && Number.isFinite(stat.blocks) ? stat.blocks * 512 : stat.size;
+    } catch { /* deleted or unreadable while scanning */ }
+  }
+  return { session_store_bytes: bytes, session_store_metric: allocated ? "allocated" : "logical" };
 }
 
 function readableSessionPaths(filePath) {
@@ -468,6 +521,9 @@ async function scanClaudeSession(filePath) {
   // this set across that group stays deterministic. Unrelated files (including
   // same-UUID siblings inside one root) are never grouped here.
   const seenMessages = new Set();
+  const performanceCollector = createClaudePerformanceCollector();
+  const modelUsageByModel = new Map();
+  const editTurnsByModel = new Map();
   const bounds = emptyBounds();
   // The basename keeps grouping stable for files that never write a sessionId
   // record, but only an *observed* sessionId may become a resumable
@@ -483,12 +539,15 @@ async function scanClaudeSession(filePath) {
   let editTurns = 0;
   let retryTurns = 0;
   let currentHadEdit = false;
+  let currentTurnModel = null;
   let subagentCalls = 0;
   const subagentTypes = new Map();
 
   function closeTurn() {
     if (currentHadEdit) {
       editTurns += 1;
+      const key = currentTurnModel || "unknown";
+      editTurnsByModel.set(key, (editTurnsByModel.get(key) || 0) + 1);
     }
     currentHadEdit = false;
   }
@@ -513,6 +572,10 @@ async function scanClaudeSession(filePath) {
         }
         let obj;
         try { obj = JSON.parse(line); } catch { continue; }
+        const timingKey = claudeMessageDedupKey(obj);
+        const countedUsage = obj.type === "assistant" && obj.message && (!timingKey || !seenMessages.has(timingKey))
+          ? normalizeClaudeUsage(obj.message.usage) : null;
+        performanceCollector.consume(obj, timingKey, countedUsage, normalizeSessionModel(obj.message?.model) || model);
         updateBounds(bounds, obj.timestamp || obj.message?.timestamp);
         if (typeof obj.sessionId === "string" && obj.sessionId) {
           rawSessionId = obj.sessionId;
@@ -546,7 +609,15 @@ async function scanClaudeSession(filePath) {
         // model instead of letting that marker overwrite it.
         const candidateModel = normalizeSessionModel(obj.message.model);
         if (candidateModel) model = candidateModel;
-        addTotals(tokens, tokenTotals(obj.message.usage));
+        currentTurnModel = model;
+        const usage = normalizeClaudeUsage(obj.message.usage);
+        addTotals(tokens, usage);
+        if (usage.total_tokens > 0) {
+          const modelUsage = modelUsageByModel.get(model) || { model, ...emptyTotals(), usage_events: 0 };
+          addTotals(modelUsage, usage);
+          modelUsage.usage_events += 1;
+          modelUsageByModel.set(model, modelUsage);
+        }
         const content = Array.isArray(obj.message.content) ? obj.message.content : [];
         for (const block of content) {
           if (!block || block.type !== "tool_use") continue;
@@ -570,6 +641,7 @@ async function scanClaudeSession(filePath) {
   }
   if (!scannedFiles) throw new Error("all grouped Claude session files failed during read");
   closeTurn();
+  const performance = performanceCollector.finish();
   return finalizeRecord({
     version: SIDECAR_VERSION,
     session_hash: sessionHash("claude", rawSessionId),
@@ -580,9 +652,16 @@ async function scanClaudeSession(filePath) {
     // wrote one — the UI then falls back to the project name.
     title: aiTitle,
     source: "claude",
+    ...sessionStorageUsage(filePaths),
     project_key: projectKey(cwd, primaryFilePath),
     project_ref: cwd || null,
     model,
+    model_usage: [...modelUsageByModel.values()].map((row) => ({
+      ...row,
+      edit_turns: finite(editTurnsByModel.get(row.model)),
+      performance: performance.byModel.get(row.model) || normalizePerformance(),
+    })),
+    performance: performance.performance,
     ...bounds,
     turns,
     edit_turns: editTurns,
@@ -685,13 +764,33 @@ async function scanCodexSession(filePath) {
   const filePaths = readableSessionPaths(filePath);
   const primaryFilePath = filePaths[0] || String(filePath || "");
   const signalCollector = createCodexDeliverySignalCollector();
+  const performanceCollector = createCodexPerformanceCollector();
+  const usageBuckets = new Map();
   const parsed = await parseCodexRolloutFile(filePaths, {
     seenTokenEvents: new Set(),
     collectBreakdowns: false,
     collectModelUsage: true,
-    onObject: signalCollector.consume,
+    onObject(obj, model) {
+      signalCollector.consume(obj, model);
+      performanceCollector.consume(obj, model);
+    },
+    onUsage(event) {
+      if (event.origin !== "compaction") performanceCollector.consumeUsage(event);
+      if (!event.delta || event.delta.total_tokens <= 0) return;
+      const ms = Date.parse(event.timestamp);
+      if (!Number.isFinite(ms)) return;
+      // Minute buckets preserve every current IANA local-midnight boundary
+      // and every integer tz_offset_minutes accepted by the local API.
+      const timestamp = new Date(Math.floor(ms / 60_000) * 60_000).toISOString();
+      const key = `${timestamp}\u0000${event.model}`;
+      const bucket = usageBuckets.get(key) || { timestamp, model: event.model || "unknown", ...emptyTotals() };
+      addTotals(bucket, event.delta);
+      mergeUsageMetadata(bucket, event.delta);
+      usageBuckets.set(key, bucket);
+    },
   });
   const signals = signalCollector.finish();
+  const performance = performanceCollector.finish();
   // The collector keyed edit turns by the model the parser handed it, so the
   // keys are the same raw model ids parsed.modelUsage rows carry. A model whose
   // edit turns produced no billable delta has no row to land on;
@@ -701,6 +800,7 @@ async function scanCodexSession(filePath) {
   const modelUsage = (parsed.modelUsage || []).map((row) => ({
     ...row,
     edit_turns: finite(editTurnsByModel[row.model]),
+    performance: performance.byModel.get(row.model) || normalizePerformance(),
   }));
   const parsedModel = normalizeSessionModel(parsed.model);
   const provider = normalizeSessionModel(parsed.provider);
@@ -742,10 +842,13 @@ async function scanCodexSession(filePath) {
     // Local-only: stripped in summarizeSessions before any cloud/CSV export.
     title,
     source: "codex",
+    ...sessionStorageUsage(filePaths),
     project_key: projectKey(parsed.cwd, primaryFilePath),
     project_ref: parsed.cwd || null,
     model,
     model_usage: modelUsage,
+    usage_buckets: [...usageBuckets.values()],
+    performance: performance.performance,
     ...signals.bounds,
     turns: signals.turns || finite(parsed.turnCount),
     edit_turns: signals.editTurns,
@@ -1022,6 +1125,7 @@ async function scanGrokSession(filePath) {
     // Local-only: stripped in summarizeSessions before any cloud/CSV export.
     title,
     source: "grok",
+    ...sessionStorageUsage([filePath, grokSummaryPathFor(filePath), grokSignalsPathFor(filePath)]),
     project_key: projectKey(cwd, filePath),
     project_ref: cwd || null,
     model: model || "unknown",
@@ -1074,8 +1178,11 @@ function providerRoots(home, providerDir, env, deps = {}) {
       && path.resolve(home) === path.resolve(homedir())
       && typeof env?.CODEX_HOME === "string"
       && env.CODEX_HOME.trim();
+    // Same normalization as sync / the cursor store (scan-roots.expandHome):
+    // a relative CODEX_HOME is anchored to home, never to process.cwd(), so
+    // the browser walks the exact root the cursors were keyed under.
     const nativeRoot = useProcessCodexHome
-      ? path.resolve(env.CODEX_HOME.trim())
+      ? expandHome(env.CODEX_HOME, home)
       : path.join(home, providerDir);
     roots.push(nativeRoot);
   }
@@ -1095,7 +1202,21 @@ function providerRoots(home, providerDir, env, deps = {}) {
     const wslRoot = discoverWslHome(providerDir, { env });
     if (wslRoot) roots.push(wslRoot);
   }
-  return [...new Set(roots)];
+  // Extra roots (#657), mirroring src/commands/sync.js: CLAUDE_CONFIG_DIR is
+  // the spawning process's implicit Claude root (additive — ~/.claude stays
+  // scanned), and config.scanRoots.<provider> arrives as deps.extraRoots from
+  // discoverSessionFiles. Extras are realpath-deduped against the roots above
+  // so one directory listed under two spellings is walked once.
+  const extras = [];
+  const useProcessClaudeConfigDir = providerDir === ".claude"
+    && path.resolve(home) === path.resolve(homedir())
+    && typeof env?.CLAUDE_CONFIG_DIR === "string"
+    && env.CLAUDE_CONFIG_DIR.trim();
+  if (useProcessClaudeConfigDir) extras.push(expandHome(env.CLAUDE_CONFIG_DIR, home));
+  for (const extra of Array.isArray(deps.extraRoots) ? deps.extraRoots : []) {
+    if (typeof extra === "string" && extra) extras.push(path.resolve(extra));
+  }
+  return appendUniqueDirs([...new Set(roots)], extras);
 }
 
 // Group one logical session discovered under more than one root. A group is
@@ -1221,10 +1342,37 @@ function groupCodexFiles(filePaths) {
 
 async function discoverSessionFiles(home, env = process.env, deps = {}) {
   const grokHome = resolveGrokHome(home);
-  const claudeRoots = providerRoots(home, ".claude", env, deps);
-  const codexRoots = providerRoots(home, ".codex", env, deps);
+  // config.scanRoots (#657): read from the tracker config unless the caller
+  // injects it (tests). A missing or malformed config yields no extras.
+  const scanRootsConfig = deps.scanRootsConfig !== undefined
+    ? normalizeScanRootsConfig(deps.scanRootsConfig)
+    : await loadScanRootsConfig({ home });
+  // expandHome resolves `~` and relative entries against `home` (never cwd);
+  // only readable directories are walked, absence and stat errors alike.
+  const extraRootsFor = (provider) => scanRootsConfig[provider]
+    .map((root) => expandHome(root, home))
+    .filter((root) => root && scanRootDirState(root).exists);
+  const claudeRoots = providerRoots(home, ".claude", env, { ...deps, extraRoots: extraRootsFor("claude") });
+  const codexRoots = providerRoots(home, ".codex", env, { ...deps, extraRoots: extraRootsFor("codex") });
+  // Two distinct roots may share one projects/ dir through a symlink; dedupe
+  // the derived projects dirs by realpath (as sync does) so the browser never
+  // lists the same transcript twice under two spellings.
+  const claudeProjectsDirs = dedupeDirsByRealpath(claudeRoots.map((r) => path.join(r, "projects")));
+  // listClaudeProjectFiles / listRolloutFilesDeep turn a listing error into an
+  // empty result, so a root whose projects/ (or sessions/) exists but cannot be
+  // read would look like "no sessions" and get cached as such. Report those
+  // directories as incomplete discovery instead; the caller decides not to
+  // persist a partial inventory (sync defers its repair on the same state).
+  const incomplete = [];
+  for (const dir of [
+    ...claudeProjectsDirs,
+    ...codexRoots.map((r) => path.join(r, "sessions")),
+  ]) {
+    const state = scanRootDirState(dir);
+    if (state.error !== null) incomplete.push({ path: dir, error: state.error });
+  }
   const [claudeGroups, codexGroups, archivedGroups, grok] = await Promise.all([
-    Promise.all(claudeRoots.map((r) => listClaudeProjectFiles(path.join(r, "projects")))),
+    Promise.all(claudeProjectsDirs.map((dir) => listClaudeProjectFiles(dir))),
     Promise.all(codexRoots.map((r) => listRolloutFilesDeep(path.join(r, "sessions")))),
     Promise.all(codexRoots.map((r) => listRolloutFilesDeep(path.join(r, "archived_sessions")))),
     listGrokSessionFiles(path.join(grokHome, "sessions")),
@@ -1239,7 +1387,20 @@ async function discoverSessionFiles(home, env = process.env, deps = {}) {
   const claude = allClaude.filter((filePaths) => !filePaths.some((filePath) => filePath
     .split(path.sep)
     .some((segment) => segment.endsWith(CLAUDE_MEM_OBSERVER_PROJECT_SUFFIX))));
-  return { claude, codex: groupCodexFiles([...codex, ...archived]), grok };
+  return { claude, codex: groupCodexFiles([...codex, ...archived]), grok, incomplete };
+}
+
+// Warn once per unreadable directory per process: the dashboard polls this
+// path, and a line per poll would flood the serve log.
+const warnedIncompleteDiscovery = new Set();
+function warnIncompleteDiscovery(incomplete) {
+  for (const entry of incomplete) {
+    if (warnedIncompleteDiscovery.has(entry.path)) continue;
+    warnedIncompleteDiscovery.add(entry.path);
+    if (!process.env.NODE_TEST_CONTEXT) {
+      console.warn(`[session-analytics] session directory unreadable (${entry.error}), inventory incomplete: ${entry.path}`);
+    }
+  }
 }
 
 function filesSignature(files) {
@@ -1368,6 +1529,19 @@ async function buildSessionAnalyticsInternal({ home = os.homedir(), force = fals
     } catch { /* first run */ }
   }
   const discovered = await discoverSessionFiles(home);
+  // Incomplete discovery (an unreadable projects/ or sessions/ dir): never let
+  // a partial inventory replace a complete snapshot. Serve the last complete
+  // sidecar when there is one; otherwise build from what is readable but do
+  // not persist it, so the next refresh tries again.
+  const incompleteDirs = Array.isArray(discovered.incomplete) ? discovered.incomplete : [];
+  if (incompleteDirs.length > 0) {
+    warnIncompleteDiscovery(incompleteDirs);
+    if (!force && previousMeta?.version === SIDECAR_VERSION) {
+      const cached = readSidecar(sidecarPath);
+      Object.defineProperty(cached, "incompleteDirs", { value: incompleteDirs, enumerable: false });
+      return cached;
+    }
+  }
   // Codex thread titles are stored separately from rollout files. Include the
   // index in the overall signature so an index-only rename reaches the
   // per-file dependency check below on the next refresh. Grok titles/metadata
@@ -1437,19 +1611,22 @@ async function buildSessionAnalyticsInternal({ home = os.homedir(), force = fals
     nextFiles[cacheKey] = { stat_key: statKey };
   }
   sessions.sort((a, b) => String(b.ended_at || "").localeCompare(String(a.ended_at || "")));
-  const content = sessions.map(serializeSessionRecord).join("\n") + (sessions.length ? "\n" : "");
-  await writeAtomic(sidecarPath, content);
-  const generatedAt = new Date().toISOString();
-  await writeAtomic(metaPath, `${JSON.stringify({
-    version: SIDECAR_VERSION,
-    signature,
-    generated_at: generatedAt,
-    checked_at: generatedAt,
-    files: nextFiles,
-  })}\n`);
+  if (incompleteDirs.length === 0) {
+    const content = sessions.map(serializeSessionRecord).join("\n") + (sessions.length ? "\n" : "");
+    await writeAtomic(sidecarPath, content);
+    const generatedAt = new Date().toISOString();
+    await writeAtomic(metaPath, `${JSON.stringify({
+      version: SIDECAR_VERSION,
+      signature,
+      generated_at: generatedAt,
+      checked_at: generatedAt,
+      files: nextFiles,
+    })}\n`);
+  }
   // Non-enumerable so the array still behaves exactly like a plain row list
   // for every existing caller (map/filter/JSON of the rows is unaffected).
   Object.defineProperty(sessions, "skippedFiles", { value: skippedFiles, enumerable: false });
+  Object.defineProperty(sessions, "incompleteDirs", { value: incompleteDirs, enumerable: false });
   return sessions;
 }
 
@@ -1487,17 +1664,55 @@ function buildSessionAnalytics(options = {}) {
 // exactly the long/resumed ones, which also sort to the top because the sort
 // key is ended_at. On real data a 7-day window lost 6 sessions, the largest
 // 224M tokens. Treat the window as an interval intersection instead.
-function withinDayRange(row, from, to) {
-  const startDay = String(row?.started_at || row?.ended_at || "").slice(0, 10);
-  const endDay = String(row?.ended_at || row?.started_at || "").slice(0, 10);
+function sessionUsageDay(timestamp, { timeZone, offsetMinutes } = {}) {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return "";
+  if (timeZone) {
+    try {
+      const parts = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(date);
+      const part = (name) => parts.find((p) => p.type === name)?.value;
+      return `${part("year")}-${part("month")}-${part("day")}`;
+    } catch { /* fall back to the caller's offset or UTC */ }
+  }
+  return new Date(date.getTime() + (Number.isFinite(offsetMinutes) ? offsetMinutes * 60_000 : 0)).toISOString().slice(0, 10);
+}
+
+function withinDayRange(row, from, to, context) {
+  const startDay = sessionUsageDay(row?.started_at || row?.ended_at || "", context);
+  const endDay = sessionUsageDay(row?.ended_at || row?.started_at || "", context);
   if (from && (!endDay || endDay < from)) return false;
   if (to && (!startDay || startDay > to)) return false;
   return true;
 }
 
-function summarizeSessions(sessions, { from = "", to = "", includeSessions = true } = {}) {
+function scopeSessionUsage(row, from, to, context) {
+  if ((!from && !to) || !Array.isArray(row.usage_buckets)) return { ...row };
+  const buckets = row.usage_buckets.filter((bucket) => {
+    const day = sessionUsageDay(bucket.timestamp, context);
+    return (!from || day >= from) && (!to || day <= to);
+  });
+  const tokens = emptyTotals();
+  const byModel = new Map();
+  for (const bucket of buckets) {
+    addTotals(tokens, bucket);
+    const model = byModel.get(bucket.model) || { model: bucket.model, ...emptyTotals(), usage_events: 0 };
+    addTotals(model, bucket);
+    mergeUsageMetadata(model, bucket);
+    if (!bucket.usage_events) model.usage_events += 1;
+    byModel.set(bucket.model, model);
+  }
+  return repriceSessionRecord({ ...row, tokens, total_tokens: tokens.total_tokens,
+    model_usage: [...byModel.values()], usage_buckets: buckets, cost_usd: 0,
+    lifetime_total_tokens: row.total_tokens, lifetime_cost_usd: row.cost_usd });
+}
+
+function summarizeSessions(sessions, { from = "", to = "", includeSessions = true, timeZone, offsetMinutes } = {}) {
+  const context = { timeZone, offsetMinutes };
   const filtered = annotateCodexThreadUsage((sessions || [])
-    .filter((row) => withinDayRange(row, from, to))
+    .filter((row) => withinDayRange(row, from, to, context))
+    // Efficiency is a session-lifetime metric: both tokens and edit turns
+    // must describe that same population. The browser scopes consumption
+    // separately; do not divide in-range tokens by lifetime edit counts here.
     .map((row) => ({ ...row })));
   const byModel = new Map();
   const subagents = new Map();
@@ -1509,6 +1724,7 @@ function summarizeSessions(sessions, { from = "", to = "", includeSessions = tru
     retries: 0,
     total_tokens: 0,
     cost_usd: 0,
+    performance: normalizePerformance(),
     edit_tokens: 0,
     edit_cost_usd: 0,
   };
@@ -1520,6 +1736,7 @@ function summarizeSessions(sessions, { from = "", to = "", includeSessions = tru
     totals.retries += finite(row.retry_turns);
     totals.total_tokens += finite(row.total_tokens);
     totals.cost_usd += finite(row.cost_usd);
+    totals.performance = mergePerformance(totals.performance, row.performance);
     if (row.productive) {
       totals.edit_tokens += finite(row.total_tokens);
       totals.edit_cost_usd += finite(row.cost_usd);
@@ -1545,6 +1762,7 @@ function summarizeSessions(sessions, { from = "", to = "", includeSessions = tru
         retries: 0,
         total_tokens: 0,
         cost_usd: 0,
+        performance: normalizePerformance(),
         edit_tokens: 0,
         edit_cost_usd: 0,
         usage_events: 0,
@@ -1557,6 +1775,7 @@ function summarizeSessions(sessions, { from = "", to = "", includeSessions = tru
       if (row.first_pass ?? row.one_shot) agg.one_shot_sessions += 1;
       agg.total_tokens += finite(usage.total_tokens);
       agg.cost_usd += finite(usage.cost_usd);
+      agg.performance = mergePerformance(agg.performance, usage.performance);
       agg.usage_events += finite(usage.usage_events);
       agg.rerouted_usage_events += finite(usage.rerouted_usage_events);
       agg.long_context_usage_events += finite(usage.long_context_usage_events);
@@ -1704,12 +1923,20 @@ function toSessionBrowserRow(row) {
     parent_link_conflict: Boolean(row.parent_link_conflict),
     title: row.title || null,
     source: row.source,
+    ...(Number.isFinite(row.session_store_bytes) ? {
+      session_store_bytes: row.session_store_bytes,
+      session_store_metric: row.session_store_metric,
+      bytes_per_1k_tokens: (row.lifetime_total_tokens ?? row.total_tokens) > 0
+        ? row.session_store_bytes * 1000 / (row.lifetime_total_tokens ?? row.total_tokens) : null,
+    } : {}),
     project_key: row.project_key,
     // project_ref (the local cwd) only ever travels over the local API so the
     // browser can show where a session ran and compose a resume command.
     project_ref: row.project_ref || null,
     model: row.model,
     model_usage: modelUsageForAggregation(row),
+    ...(Array.isArray(row.usage_buckets) ? { usage_buckets: row.usage_buckets } : {}),
+    performance: normalizePerformance(row.performance),
     started_at: row.started_at || null,
     ended_at: row.ended_at || null,
     duration_ms: finite(row.duration_ms),
@@ -1768,6 +1995,7 @@ function mergeSessionFragments(rows) {
         ...row,
         tokens: row.tokens && typeof row.tokens === "object" ? { ...row.tokens } : emptyTotals(),
         model_usage: normalizeModelUsageRows(row.model_usage),
+        performance: normalizePerformance(row.performance),
         _repr_tokens: finite(row.total_tokens),
       });
       continue;
@@ -1775,13 +2003,18 @@ function mergeSessionFragments(rows) {
     cur.turns = finite(cur.turns) + finite(row.turns);
     cur.edit_turns = finite(cur.edit_turns) + finite(row.edit_turns);
     cur.retry_turns = finite(cur.retry_turns) + finite(row.retry_turns);
+    cur.performance = mergePerformance(cur.performance, row.performance);
     cur.subagent_calls = finite(cur.subagent_calls) + finite(row.subagent_calls);
     addTotals(cur.tokens, row.tokens);
+    if (Array.isArray(row.usage_buckets)) {
+      cur.usage_buckets = [...(cur.usage_buckets || []), ...row.usage_buckets];
+    }
     cur.model_usage = normalizeModelUsageRows([
       ...(cur.model_usage || []),
       ...(row.model_usage || []),
     ]);
     cur.total_tokens = finite(cur.total_tokens) + finite(row.total_tokens);
+    if (Number.isFinite(row.session_store_bytes)) cur.session_store_bytes = finite(cur.session_store_bytes) + row.session_store_bytes;
     cur.cost_usd = finite(cur.cost_usd) + finite(row.cost_usd);
     cur.provider_cost_usd = finite(cur.provider_cost_usd) + finite(row.provider_cost_usd);
     cur.usage_events = finite(cur.usage_events) + finite(row.usage_events);
@@ -1958,7 +2191,8 @@ function annotateCodexThreadUsage(rows) {
 // summarizeSessions (cloud/CSV safe), this retains session_id + project_ref so
 // the UI can offer one-click resume. Callers must only expose it over the
 // local API.
-function listSessionsForBrowser(sessions, { from = "", to = "", limit = 0 } = {}) {
+function listSessionsForBrowser(sessions, { from = "", to = "", limit = 0, timeZone, offsetMinutes } = {}) {
+  const context = { timeZone, offsetMinutes };
   const filtered = annotateCodexThreadUsage(mergeSessionFragments(sessions)
     // Only sessions that actually spent tokens are worth listing. This drops
     // two kinds of noise: non-session logs under ~/.claude/projects
@@ -1966,7 +2200,9 @@ function listSessionsForBrowser(sessions, { from = "", to = "", limit = 0 } = {}
     // the model replied. Both render as "unknown · 0 tokens · $0.00" rows with
     // no model, no cost and nothing to analyze.
     .filter((row) => finite(row.total_tokens) > 0)
-    .filter((row) => withinDayRange(row, from, to)));
+    .filter((row) => withinDayRange(row, from, to, context))
+    .map((row) => scopeSessionUsage(row, from, to, context))
+    .filter((row) => !Array.isArray(row.usage_buckets) || finite(row.total_tokens) > 0));
   filtered.sort((a, b) => String(b.ended_at || "").localeCompare(String(a.ended_at || "")));
   const cap = Number(limit) > 0 ? Number(limit) : 0;
   const limited = cap > 0 ? filtered.slice(0, cap) : filtered;
@@ -2006,6 +2242,7 @@ module.exports = {
   resumeCommandFor,
   sessionsToCsv,
   providerRoots,
+  discoverSessionFiles,
   dedupeClaudeFilesAcrossRoots,
   analyticsEntryStatKey,
 };

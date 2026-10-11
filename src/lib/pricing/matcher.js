@@ -238,7 +238,13 @@ function lookupContainedExactCaseInsensitive(table, model) {
   const lower = model.toLowerCase();
   const keys = Object.keys(table).sort((a, b) => b.length - a.length);
   for (const key of keys) {
-    if (lower.includes(key.toLowerCase())) return table[key];
+    const start = lower.indexOf(key.toLowerCase());
+    if (start < 0) continue;
+    // A model generation must not match a later numeric version (Opus 5.5
+    // is a separate SKU from Opus 5). Dated and provider suffixes still work.
+    const suffix = lower.slice(start + key.length);
+    if (/^[.\d]/.test(suffix)) continue;
+    return table[key];
   }
   return null;
 }
@@ -256,6 +262,16 @@ function lookupPricing(model, { curated, litellm, source } = {}) {
   // 0. CURATED source exact. Source-specific prices apply only to their source,
   // preventing collisions with public prices for same-named models from other CLIs.
   const sourceKey = typeof source === "string" ? source.toLowerCase() : "";
+  if (sourceKey === "workbuddy-ai" && lower.trim() === "auto") {
+    return { hit: false, source: "miss", value: null };
+  }
+  if (sourceKey === "cline" && lower.endsWith(":free")) {
+    return {
+      hit: true,
+      source: "curated:cline-free-suffix",
+      value: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+    };
+  }
   // AStudio does not disclose its routed model. Stop before generic aliases
   // and fuzzy matching can turn an unresolved router into a priced model.
   if (sourceKey === "acode" && (lower === "auto" || lower.endsWith("-auto"))) {
@@ -270,16 +286,17 @@ function lookupPricing(model, { curated, litellm, source } = {}) {
   }
 
   // 1. CURATED exact
+  // Qwen Flash's provider-qualified and dated IDs share the reference SKU.
+  // Keep the boundary strict: Flash-Next and Max have independent prices.
+  if (/(?:^|\/)qwen3[.-]8-flash(?:-\d{4}-\d{2}-\d{2})?$/.test(lower.trim()) && curated.exact?.["qwen3.8-flash"]) {
+    return { hit: true, source: "curated:exact", value: curated.exact["qwen3.8-flash"] };
+  }
   if (curated.exact && curated.exact[lookupModel]) {
     return { hit: true, source: "curated:exact", value: curated.exact[lookupModel] };
   }
   const curatedDotExact = lookupExactCaseInsensitive(curated.exact, dotForm);
   if (curatedDotExact) {
     return { hit: true, source: "curated:exact-dot", value: curatedDotExact };
-  }
-  const curatedDotContainedExact = lookupContainedExactCaseInsensitive(curated.exact, dotForm);
-  if (curatedDotContainedExact) {
-    return { hit: true, source: "curated:exact-dot", value: curatedDotContainedExact };
   }
 
   // 2. LiteLLM exact
@@ -289,6 +306,10 @@ function lookupPricing(model, { curated, litellm, source } = {}) {
   const litellmDotExact = lookupExactCaseInsensitive(litellm, dotForm);
   if (litellmDotExact) {
     return { hit: true, source: "litellm:exact-dot", value: litellmDotExact };
+  }
+  const curatedDotContainedExact = lookupContainedExactCaseInsensitive(curated.exact, dotForm);
+  if (curatedDotContainedExact) {
+    return { hit: true, source: "curated:exact-dot", value: curatedDotContainedExact };
   }
 
   // 3. CURATED alias (literal mapping like "auto" -> "composer-1")

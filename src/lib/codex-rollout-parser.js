@@ -570,6 +570,7 @@ async function parseCodexRolloutFile(filePath, {
   collectBreakdowns = true,
   collectModelUsage = false,
   onObject = null,
+  onUsage = null,
 } = {}) {
   const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
   const primaryFilePath = filePaths[0] || String(filePath || "");
@@ -712,6 +713,8 @@ async function parseCodexRolloutFile(filePath, {
       };
       byModel.set(effectiveModel, row);
     }
+    const subsetKeys = Object.keys(row).filter((key) => /^(?:long_context_|priority_)|^(?:usage_events|rerouted_usage_events)$/.test(key));
+    const before = Object.fromEntries(subsetKeys.map((key) => [key, row[key]]));
     addInto(row, delta);
     row.usage_events += 1;
     if (attribution.selectedModel) {
@@ -757,6 +760,10 @@ async function parseCodexRolloutFile(filePath, {
         row.priority_long_context_reasoning_output_tokens += delta.reasoning_output_tokens;
       }
     }
+    return { ...delta, ...Object.fromEntries(subsetKeys.map((key) => [key, row[key] - before[key]])),
+      selected_models: attribution.selectedModel ? [attribution.selectedModel] : [],
+      reroute_reasons: attribution.rerouteReason ? [attribution.rerouteReason] : [],
+      model_attribution: attribution.rerouted ? "effective" : "selected" };
   }
 
   function ensureTool(name) {
@@ -926,7 +933,9 @@ async function parseCodexRolloutFile(filePath, {
     if (compactionResponseIds.has(record.responseId)) return;
     compactionResponseIds.add(record.responseId);
     if (!record.inRequestedRange) return;
-    recordModelUsage(record.delta, record.rawUsage, record.attribution);
+    const pricedDelta = recordModelUsage(record.delta, record.rawUsage, record.attribution);
+    if (typeof onUsage === "function") onUsage({ timestamp: record.timestamp,
+      delta: pricedDelta || record.delta, rawUsage: record.rawUsage, model: record.attribution.model, origin: "compaction" });
     attributeTurn(record.delta);
   }
 
@@ -1085,16 +1094,20 @@ async function parseCodexRolloutFile(filePath, {
       }
       const rawDelta = consumeUsageDelta(usageDeltaState, lastUsage, totalUsage);
       const delta = rawDelta ? normalizeUsage(rawDelta) : null;
+      // Timing consumers receive canonical, deduplicated usage below. A null
+      // delta is a snapshot, not another model response.
       if (compaction) countCompactionRecord(compaction);
       const isNewResumeEvent = noteTokenEvent(ts, lastUsage, totalUsage);
       if (inRequestedRange) {
         const eventSessionId = sessionId || rolloutSessionIdFromPath(primaryFilePath) || primaryFilePath;
         const eventKey = `${eventSessionId}:${ts}:${usageEventSignature(lastUsage, totalUsage)}`;
         if (!isNewResumeEvent || (seenTokenEvents && seenTokenEvents.has(eventKey))) {
+          if (typeof onUsage === "function") onUsage({ timestamp: ts, delta: null, rawUsage: lastUsage, model: attributedModel });
           attributeTurn(null);
         } else {
           if (seenTokenEvents && delta?.total_tokens > 0) seenTokenEvents.add(eventKey);
-          recordModelUsage(delta, lastUsage || rawDelta);
+          const pricedDelta = recordModelUsage(delta, lastUsage || rawDelta);
+          if (typeof onUsage === "function") onUsage({ timestamp: ts, delta: pricedDelta || delta, rawUsage: lastUsage || rawDelta, model: attributedModel });
           attributeTurn(delta);
         }
       } else {

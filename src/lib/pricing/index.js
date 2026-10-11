@@ -29,7 +29,7 @@ const LOCAL_INFERENCE_SOURCES = new Set(["lmstudio"]);
 // including cached tokens, never a session/day aggregate. Astra supports
 // a larger context window; only observed request subsets receive the premium.
 const OPENAI_LONG_CONTEXT_INPUT_THRESHOLD = 272_000;
-const SOURCES_WITH_AUTHORITATIVE_COST = new Set(["grok"]);
+const SOURCES_WITH_AUTHORITATIVE_COST = new Set(["grok", "cline"]);
 const SEED_SNAPSHOT_PATH = path.resolve(__dirname, "seed-snapshot.json");
 const DEEPSEEK_TIME_PRICED_MODELS = [
   "deepseek-v4-flash",
@@ -131,6 +131,50 @@ function getModelPricing(model, opts = {}) {
   return ZERO_PRICING;
 }
 
+// Callers hit this once per queue row, and a miss walks the whole LiteLLM map,
+// so results are memoized per pricing revision. Copies go out so a caller that
+// mutates its object cannot poison the cache.
+const pricingInfoCache = { revision: -1, entries: new Map() };
+
+// Preserve matcher provenance: a known zero rate is free, a missing model is
+// unpriced. Both return zero dollars, but they mean different things in the UI.
+function getModelPricingInfo(model, opts = {}) {
+  const source = typeof opts === "string" ? opts : opts.source;
+  const sourceKey = typeof source === "string" ? source.toLowerCase() : null;
+  if (pricingInfoCache.revision !== state.revision) {
+    pricingInfoCache.revision = state.revision;
+    pricingInfoCache.entries.clear();
+  }
+  const cacheKey = `${sourceKey || ""}\0${model || ""}`;
+  let info = pricingInfoCache.entries.get(cacheKey);
+  if (!info) {
+    info = computeModelPricingInfo(model, opts, sourceKey);
+    pricingInfoCache.entries.set(cacheKey, info);
+  }
+  return { ...info };
+}
+
+function computeModelPricingInfo(model, opts, sourceKey) {
+  if (LOCAL_INFERENCE_SOURCES.has(sourceKey) || PI_SUBSCRIPTION_SOURCES.has(sourceKey)) {
+    return { status: "free", source: LOCAL_INFERENCE_SOURCES.has(sourceKey) ? "local_inference" : "subscription", ...ZERO_PRICING };
+  }
+  const result = lookupPricing(model, {
+    curated: curatedOverrides,
+    litellm: state.litellmPerMillionMap,
+    source: sourceKey,
+  });
+  const rates = getModelPricing(model, opts);
+  return {
+    status: !result.hit ? "unpriced" : [rates.input, rates.output, rates.cache_read, rates.cache_write]
+      .some((value) => Number(value) > 0) ? "priced" : "free",
+    source: result.hit ? result.source : null,
+    input: Number(rates.input) || 0,
+    output: Number(rates.output) || 0,
+    cache_read: Number(rates.cache_read) || 0,
+    cache_write: Number(rates.cache_write) || 0,
+  };
+}
+
 function isDeepSeekTimePricedModel(model) {
   const lower = String(model || "").toLowerCase();
   return DEEPSEEK_TIME_PRICED_MODELS.some((name) => lower.includes(name));
@@ -198,12 +242,15 @@ function computeRowCost(row) {
   const pricing = getRowPricing(row);
   // OmO, like Codex, reports reasoning as a subset of `output` (its own
   // usage.cost bills no separate reasoning component), so charging it again
-  // here would double-bill every reasoning token.
+  // here would double-bill every reasoning token. Cline is the same: its
+  // `outputTokens` is the AI SDK total (text + reasoning), so
+  // reasoning_output_tokens is a subset marker, never a second line item.
   const reasoningIncludedInOutput =
     row.source === "codex" ||
     row.source === "acode" ||
     row.source === "every-code" ||
-    row.source === "omo";
+    row.source === "omo" ||
+    row.source === "cline";
   const reasoningCost = reasoningIncludedInOutput
     ? 0
     : (row.reasoning_output_tokens || 0) * (pricing.output || 0);
@@ -219,7 +266,7 @@ function computeRowCost(row) {
   const model = String(row?.model || "").toLowerCase();
   const usesOpenAILongContextTier =
     model === "gpt-5.6" || model.includes("gpt-5.6-sol") || model.includes("gpt-6-astra") ||
-    model.includes("gpt-6-sol");
+    model.includes("gpt-6-sol") || model.includes("gpt-6.1-sol");
   // Only models whose curated entry carries an explicit Fast/priority rate get
   // the tier premium. The other OpenAI tiers have no published priority price,
   // and inventing one is worse than reporting Standard.
@@ -319,6 +366,7 @@ module.exports = {
   ensurePricingLoaded,
   getPricingRevision,
   getModelPricing,
+  getModelPricingInfo,
   getRowPricing,
   computeRowCost,
   resetPricingForTests,
